@@ -1,0 +1,324 @@
+---
+title: "Rank based matchmaking in Rocket League"
+format:
+  html:
+    page-layout: full
+    toc: true
+    css: styles.css
+---
+
+## 'Root Mean Square'
+
+$$
+\sqrt[n]{\frac{\mathrm{MMR}_{1}^{n}+\mathrm{MMR}_{2}^{n}+...+\mathrm{MMR}_{x}^{n} }{x}}
+$$
+
+| playlist    | n   |
+|-------------|-----|
+| casual      | 7   |
+| competitive | 15  |
+
+## Skill based matchmaking (in a party)
+
+```{r}
+#| warning: false
+
+party_matchmaking <- function(mmr_arr, n){
+  
+  
+  return(
+    (sum(mmr_arr^n) / (length(mmr_arr)))^(1/n)
+  )
+}
+
+party_matchmaking(c(200,500),15)
+```
+
+## True Skill
+
+```{r}
+#| warning: false
+
+true_skill <- function(mmr){
+  mmr <- mmr - 100
+  return(mmr / 20)
+}
+
+true_skill(c(618,609))
+```
+
+## MMR Demo (R)
+
+```{r}
+#| warning: false
+
+library(dplyr)
+library(tidyr)
+
+# Rater Class
+Rater <- setRefClass(
+  "Rater",
+  fields = list(beta_sq = "numeric"),
+  methods = list(
+    initialize = function(beta) {
+      beta_sq <<- beta * beta
+    },
+    update_ratings = function(teams, ranks) {
+      if (length(teams) != length(ranks)) {
+        stop("`teams` and `ranks` vectors must be of the same length")
+      }
+      
+      team_mu <- rep(0.0, length(teams))
+      team_sigma_sq <- rep(0.0, length(teams))
+      team_omega <- rep(0.0, length(teams))
+      team_delta <- rep(0.0, length(teams))
+      
+      for (team_idx in seq_along(teams)) {
+        if (length(teams[[team_idx]]) == 0) {
+          stop("At least one of the teams contains no players")
+        }
+        
+        for (player in teams[[team_idx]]) {
+          team_mu[team_idx] <- team_mu[team_idx] + player$mu
+          team_sigma_sq[team_idx] <- team_sigma_sq[team_idx] + player$sigma_sq
+        }
+      }
+      
+      for (team_idx in seq_along(teams)) {
+        for (team2_idx in seq_along(teams)) {
+          if (team_idx == team2_idx) next
+          
+          c <- sqrt(team_sigma_sq[team_idx] + team_sigma_sq[team2_idx] + 2.0 * beta_sq)
+          e1 <- exp(team_mu[team_idx] / c)
+          e2 <- exp(team_mu[team2_idx] / c)
+          piq <- e1 / (e1 + e2)
+          pqi <- e2 / (e1 + e2)
+          ri <- ranks[team_idx]
+          rq <- ranks[team2_idx]
+          
+          s <- switch(
+            as.character(sign(rq - ri)),
+            "1" = 1.0,
+            "0" = 0.5,
+            "-1" = 0.0,
+            stop("Invalid rank comparison")
+          )
+          
+          delta <- (team_sigma_sq[team_idx] / c) * (s - piq)
+          gamma <- sqrt(team_sigma_sq[team_idx]) / c
+          eta <- gamma * (team_sigma_sq[team_idx] / (c * c)) * piq * pqi
+          
+          team_omega[team_idx] <- team_omega[team_idx] + delta
+          team_delta[team_idx] <- team_delta[team_idx] + eta
+        }
+      }
+      
+      result <- vector("list", length(teams))
+      
+      for (team_idx in seq_along(teams)) {
+        team_result <- vector("list", length(teams[[team_idx]]))
+        
+        for (player_idx in seq_along(teams[[team_idx]])) {
+          player <- teams[[team_idx]][[player_idx]]
+          new_mu <- player$mu + (player$sigma_sq / team_sigma_sq[team_idx]) * team_omega[team_idx]
+          
+          sigma_adj <- 1.0 - (player$sigma_sq / team_sigma_sq[team_idx]) * team_delta[team_idx]
+          sigma_adj <- ifelse(sigma_adj < 0.0001, 0.0001, sigma_adj)
+          
+          new_sigma_sq <- player$sigma_sq * sigma_adj
+          
+          team_result[[player_idx]] <- Rating$new(mu = new_mu, sigma = sqrt(new_sigma_sq))
+        }
+        
+        result[[team_idx]] <- team_result
+      }
+      
+      result
+    },
+    duel = function(p1, p2, outcome) {
+      teams <- list(list(p1), list(p2))
+      ranks <- switch(
+        outcome,
+        "Win" = c(1, 2),
+        "Loss" = c(2, 1),
+        "Draw" = c(1, 1)
+      )
+      
+      result <- update_ratings(teams, ranks)
+      
+      list(result[[1]][[1]], result[[2]][[1]])
+    }
+  )
+)
+
+# Rating Class
+Rating <- setRefClass(
+  "Rating",
+  fields = list(mu = "numeric", sigma = "numeric", sigma_sq = "numeric"),
+  methods = list(
+    initialize = function(mu = 25, sigma = 25 / 3) {
+      mu <<- mu
+      sigma <<- sigma
+      sigma_sq <<- sigma^2
+    }
+  )
+)
+
+# Example Usage
+rater <- Rater$new(beta = 25 / 3)
+p1 <- Rating$new()
+p2 <- Rating$new()
+
+print(p1)
+
+
+# Two-player duel example
+
+result <- rater$duel(p1, p2, "Draw")
+
+print(result)
+```
+
+## MMR Demo (Python)
+
+```{python}
+#| warning: false
+import math
+from enum import Enum
+
+
+class Rating:
+    def __init__(self, mu=25.0, sigma=25.0/3.0):
+        self.mu = mu
+        self.sigma = sigma
+        self.sigma_sq = sigma ** 2
+
+    def __repr__(self):
+        return f"Rating(mu={self.mu}, sigma={self.sigma})"
+
+
+class Outcome(Enum):
+    WIN = "Win"
+    LOSS = "Loss"
+    DRAW = "Draw"
+
+
+class Rater:
+    def __init__(self, beta):
+        self.beta_sq = beta ** 2
+
+    def update_ratings(self, teams, ranks):
+        if len(teams) != len(ranks):
+            raise ValueError("`teams` and `ranks` vectors must be of the same length")
+        
+        team_mu = [0.0] * len(teams)
+        team_sigma_sq = [0.0] * len(teams)
+        team_omega = [0.0] * len(teams)
+        team_delta = [0.0] * len(teams)
+        
+        for team_idx, team in enumerate(teams):
+            if len(team) == 0:
+                raise ValueError("At least one of the teams contains no players")
+            
+            for player in team:
+                team_mu[team_idx] += player.mu
+                team_sigma_sq[team_idx] += player.sigma_sq
+        
+        for team_idx in range(len(teams)):
+            for team2_idx in range(len(teams)):
+                if team_idx == team2_idx:
+                    continue
+                
+                c = math.sqrt(team_sigma_sq[team_idx] + team_sigma_sq[team2_idx] + 2.0 * self.beta_sq)
+                e1 = math.exp(team_mu[team_idx] / c)
+                e2 = math.exp(team_mu[team2_idx] / c)
+                piq = e1 / (e1 + e2)
+                pqi = e2 / (e1 + e2)
+                ri = ranks[team_idx]
+                rq = ranks[team2_idx]
+                
+                s = 1.0 if rq > ri else 0.5 if rq == ri else 0.0
+                
+                delta = (team_sigma_sq[team_idx] / c) * (s - piq)
+                gamma = math.sqrt(team_sigma_sq[team_idx]) / c
+                eta = gamma * (team_sigma_sq[team_idx] / (c ** 2)) * piq * pqi
+                
+                team_omega[team_idx] += delta
+                team_delta[team_idx] += eta
+        
+        result = []
+        
+        for team_idx, team in enumerate(teams):
+            team_result = []
+            
+            for player in team:
+                new_mu = player.mu + (player.sigma_sq / team_sigma_sq[team_idx]) * team_omega[team_idx]
+                sigma_adj = 1.0 - (player.sigma_sq / team_sigma_sq[team_idx]) * team_delta[team_idx]
+                sigma_adj = max(sigma_adj, 0.0001)
+                
+                new_sigma_sq = player.sigma_sq * sigma_adj
+                
+                team_result.append(Rating(mu=new_mu, sigma=math.sqrt(new_sigma_sq)))
+            
+            result.append(team_result)
+        
+        return result
+
+    def duel(self, p1, p2, outcome):
+        teams = [[p1], [p2]]
+        ranks = [1, 2] if outcome == Outcome.WIN else [2, 1] if outcome == Outcome.LOSS else [1, 1]
+        
+        result = self.update_ratings(teams, ranks)
+        
+        return result[0][0], result[1][0]
+
+
+# Example Usage
+rater = Rater(beta=25.0/3.0)
+p1 = Rating()
+p2 = Rating()
+
+print(p1)
+
+# Two-player duel example
+result = rater.duel(p1, p2, Outcome.WIN)
+
+print(result)
+
+```
+
+## Simulate Matches
+
+```{python}
+
+import random
+
+class Player:
+    def __init__(self, name):
+        self.name = name
+        self.rating = Rating()
+
+    def __repr__(self):
+        return f"{self.name}: {self.rating}"
+
+def simulate_duels(rater, players, num_duels):
+    for _ in range(num_duels):
+        p1, p2 = random.sample(players, 2)
+        outcome = random.choice([Outcome.WIN, Outcome.LOSS, Outcome.DRAW])
+        new_p1, new_p2 = rater.duel(p1.rating, p2.rating, outcome)
+        p1.rating = new_p1
+        p2.rating = new_p2
+        print(f"{p1.name} vs {p2.name} -> {outcome.name}")
+
+# Example Usage
+rater = Rater(beta=25.0/3.0)
+players = [Player(name=f"Player {i+1}") for i in range(10)]
+
+# Simulate 20 duels
+simulate_duels(rater, players, 20)
+
+# Print final ratings
+for player in players:
+    print(player)
+
+```
